@@ -451,7 +451,7 @@ static NSString *const NSURLDownloadEntityTag = @"NSURLDownloadEntityTag";
 	{
 		NSHTTPURLResponse *http = (NSHTTPURLResponse *) response;
 		_contentType = http.MIMEType;
-		
+        
 		if (http.statusCode >= 400)
 		{
 			NSDictionary *userInfo = [NSDictionary dictionaryWithObject:[NSHTTPURLResponse localizedStringForStatusCode:http.statusCode] forKey:NSLocalizedDescriptionKey];
@@ -467,11 +467,6 @@ static NSString *const NSURLDownloadEntityTag = @"NSURLDownloadEntityTag";
 		if (_expectedContentLength <= 0)
 		{
 			_expectedContentLength = [response expectedContentLength];
-			
-			if (_expectedContentLength == NSURLResponseUnknownLength)
-			{
-				NSLog(@"No expected content length for %@", _URL);
-			}
 		}
 		
 		NSString *currentEntityTag = [http.allHeaderFields objectForKey:@"Etag"];
@@ -498,25 +493,38 @@ static NSString *const NSURLDownloadEntityTag = @"NSURLDownloadEntityTag";
 		{
 			NSDateFormatter *dateFormatter = [[NSDateFormatter alloc] init];
 			[dateFormatter setDateFormat:@"EEE, dd MMM yyyy HH:mm:ss zzz"];
-			NSLocale *locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US"];
+			NSLocale *locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_GB"];
 			[dateFormatter setLocale:locale];
 			
 			_lastModifiedDate = [dateFormatter dateFromString:modified];
+            
+            if (!_lastModifiedDate)
+            {
+                NSLog(@"Cannot parse Last-Modified %@", modified);
+            }
 		}
 		
+        BOOL shouldCancel = NO;
+        
+        if (http.statusCode == 304)
+        {
+            // treat Not Modified same as a cancel to avoid returning empty file
+            shouldCancel = YES;
+        }
+        
 		if (_responseHandler)
 		{
-			BOOL shouldCancel = NO;
 			_responseHandler([http allHeaderFields], &shouldCancel);
-			
-			if (shouldCancel)
-			{
-				[self stop];
-				
-				// exit here to avoid adding of download bundle folder
-				return;
-			}
 		}
+        
+        if (shouldCancel)
+        {
+            [self stop];
+            
+            // exit here to avoid adding of download bundle folder
+            return;
+        }
+
 		
 		// if _destinationBundleFilePath is not nil this means that it is a resumable download
 		if (!_destinationBundleFilePath)
