@@ -11,6 +11,7 @@
 #import <DTFoundation/DTWeakSupport.h>
 #import <DTFoundation/NSString+DTPaths.h>
 #import <DTFoundation/NSString+DTFormatNumbers.h>
+#import <DTFoundation/NSURL+DTComparing.h>
 
 #if TARGET_OS_IPHONE
 #import <DTFoundation/DTAsyncFileDeleter.h>
@@ -22,6 +23,7 @@
 #import "DTDownload.h"
 
 NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFile";
+NSInteger DTDownloadCacheCancelError = 999;
 
 @interface DTDownloadCache ()
 
@@ -62,9 +64,12 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	// timer that does cache maintenance
 	NSTimer *_maintenanceTimer;
 	BOOL _needsMaintenance;
+	
+	// image decompression
+	dispatch_queue_t _decompressionQueue;
     
-    // image decompression
-    dispatch_queue_t _decompressionQueue;
+    // completion handler queue
+    dispatch_queue_t _completionHandlerQueue;
 }
 
 + (DTDownloadCache *)sharedInstance
@@ -101,7 +106,9 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		// reset status of downloads
 		[self _resetDownloadStatus];
 		
-        _decompressionQueue = dispatch_queue_create("DTDownloadCache Decompression Queue", 0);
+        _decompressionQueue = dispatch_queue_create("DTDownloadCache Decompression Queue", DISPATCH_QUEUE_SERIAL);
+        
+        _completionHandlerQueue = dispatch_queue_create("DTDownloadCache Completion Handler Queue", DISPATCH_QUEUE_SERIAL);
         
 		_saveTimer = [NSTimer scheduledTimerWithTimeInterval:5.0 target:self selector:@selector(_saveTimerTick:) userInfo:nil repeats:YES];
 		
@@ -178,7 +185,7 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
                 [dateFormatter setDateFormat:@"EEE, dd MMM yyyy HH:mm:ss zzz"];
                 NSLocale *locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_GB"];
                 [dateFormatter setLocale:locale];
-               // [dateFormatter setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"UTC"]];
+                [dateFormatter setTimeZone:[NSTimeZone timeZoneWithAbbreviation:@"UTC"]];
                 
                 NSString *dateStr = [dateFormatter stringFromDate:lastModifiedDate];
                 
@@ -231,8 +238,6 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 		[self _commitWorkerContext];
 		
 		[_activeDownloads removeObject:download];
-		
-		[self _unregisterAllCompletionBlocksForURL:download.URL];
 	}];
 }
 
@@ -265,6 +270,33 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 			}
 		}
 	}];
+}
+
+- (void)_executeAndRemoveAllCompletionBlocksForURL:(NSURL *)URL data:(NSData *)data error:(NSError *)error
+{
+    dispatch_async(_completionHandlerQueue, ^{
+        NSString *key = [URL absoluteString];
+        NSArray *blocksToExecute = _completionHandlers[key];
+        
+        // excecute all blocks and forward the error
+        for (DTDownloadCacheDataCompletionBlock oneBlock in blocksToExecute)
+        {
+            
+            oneBlock(URL, data, error);
+        }
+        
+        // remove all handlers for the key
+        [_completionHandlers removeObjectForKey:key];
+    });
+}
+
+- (void)_callCompletionBlocksForCancellingOfURL:(NSURL *)URL
+{
+    NSString *key = [URL absoluteString];
+    NSDictionary *userInfo = @{[NSString stringWithFormat:@"Download cancelled for URL: %@", key] : NSLocalizedDescriptionKey};
+    NSError *error = [NSError errorWithDomain:DTDownloadErrorDomain code:DTDownloadCacheCancelError userInfo:userInfo];
+    
+    [self _executeAndRemoveAllCompletionBlocksForURL:URL data:nil error:error];
 }
 
 #pragma mark External Methods
@@ -386,7 +418,7 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 
 - (NSData *)cachedDataForURL:(NSURL *)URL option:(DTDownloadCacheOption)option priority:(DTDownloadCachePriority)priority
 {
-	return [self cachedDataForURL:URL option:option completion:NULL];
+	return [self cachedDataForURL:URL option:option priority:priority completion:NULL];
 }
 
 - (NSUInteger)currentDiskUsage
@@ -394,30 +426,66 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	return [self _currentDiskUsageInContext:_workerContext];
 }
 
+- (void)cancelDownloadForURL:(NSURL *)URL
+{
+	// Call all existing completion blocks for this URL and remove them
+	[self _callCompletionBlocksForCancellingOfURL:URL];
+	
+	// Stop all active downloads for this URL
+	for (DTDownload *download in _activeDownloads)
+	{
+		if ([download.URL isEqualToURL:URL])
+		{
+			[download stop];
+		}
+	}
+	
+	// Change status of queued downloads to not be downloaded
+	[_workerContext performBlockAndWait:^{
+		
+		NSFetchRequest *request = [NSFetchRequest fetchRequestWithEntityName:@"DTCachedFile"];
+		request.predicate = [NSPredicate predicateWithFormat:@"isLoading == NO and fileData == nil and remoteURL == %@", URL.absoluteString];
+		
+		NSError *error;
+		NSArray *results = [_workerContext executeFetchRequest:request error:&error];
+		
+		if (!results)
+		{
+			NSLog(@"Error fetching download files: %@", [error localizedDescription]);
+			return;
+		}
+		
+		for (DTCachedFile *cachedFile in results)
+		{
+			// Setting forceLoad to NO excludes it from future downloads
+			cachedFile.forceLoad = @(NO);
+			
+			[self _commitWorkerContext];
+		}
+	}];
+}
+
 #pragma mark DTDownload
 
 - (void)download:(DTDownload *)download didFailWithError:(NSError *)error
 {
 	[_workerContext performBlock:^{
-		NSString *key = [download.URL absoluteString];
-		NSArray *blocksToExecute = _completionHandlers[key];
-		
-		// excecute all blocks and forward the error
-		for (DTDownloadCacheDataCompletionBlock oneBlock in blocksToExecute)
-		{
-			oneBlock(download.URL, nil, error);
-		}
 		
 		[self _removeDownloadFromActiveDownloads:download];
+        
+        [self _executeAndRemoveAllCompletionBlocksForURL:download.URL data:nil error:error];
 		
 		[self _startNextQueuedDownload];
 	}];
 }
 
 - (void)downloadDidCancel:(DTDownload *)download
-{
+{	
 	[_workerContext performBlock:^{
+		
 		[self _removeDownloadFromActiveDownloads:download];
+        
+        [self _callCompletionBlocksForCancellingOfURL:download.URL];
 		
 		[self _startNextQueuedDownload];
 	}];
@@ -473,17 +541,10 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 			[[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
 #endif
 			
-			NSString *key = [download.URL absoluteString];
-			NSArray *blocksToExecute = _completionHandlers[key];
-			
-			// excecute all blocks and forward the error
-			for (DTDownloadCacheDataCompletionBlock oneBlock in blocksToExecute)
-			{
-				oneBlock(URL, data, nil);
-			}
-			
 			// remove from active downloads
 			[self _removeDownloadFromActiveDownloads:download];
+            
+            [self _executeAndRemoveAllCompletionBlocksForURL:URL data:data error:nil];
 			
 			// completion block and notification
 			dispatch_async(dispatch_get_main_queue(), ^{
@@ -910,28 +971,23 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	}
 }
 
-#pragma mark Completion Blocks
+#pragma mark - Completion Blocks
 
 - (void)_registerCompletion:(DTDownloadCacheDataCompletionBlock)completion forURL:(NSURL *)URL
 {
-	NSString *key = [URL absoluteString];
-	
-	NSMutableArray *completionBlocksForURL = _completionHandlers[key];
-	
-	if (!completionBlocksForURL)
-	{
-		completionBlocksForURL = [[NSMutableArray alloc] init];
-		_completionHandlers[key] = completionBlocksForURL;
-	}
-	
-	[completionBlocksForURL addObject:[completion copy]];
-}
-
-- (void)_unregisterAllCompletionBlocksForURL:(NSURL *)URL
-{
-	NSString *key = [URL absoluteString];
-	
-	[_completionHandlers removeObjectForKey:key];
+    dispatch_async(_completionHandlerQueue, ^{
+		NSString *key = [URL absoluteString];
+		
+		NSMutableArray *completionBlocksForURL = _completionHandlers[key];
+		
+		if (!completionBlocksForURL)
+		{
+			completionBlocksForURL = [[NSMutableArray alloc] init];
+			_completionHandlers[key] = completionBlocksForURL;
+		}
+		
+		[completionBlocksForURL addObject:[completion copy]];
+    });
 }
 
 #pragma mark - Notifications
@@ -1047,7 +1103,7 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 	}
 	
 	// try file cache, this triggers a new load
-	NSData *data = [self cachedDataForURL:URL option:option completion:internalBlock];
+	NSData *data = [self cachedDataForURL:URL option:option priority:priority completion:internalBlock];
 	
 	if (cachedImage)
 	{
@@ -1097,6 +1153,7 @@ NSString *DTDownloadCacheDidCacheFileNotification = @"DTDownloadCacheDidCacheFil
 {
 	return [self cachedImageForURL:URL option:option completion:NULL];
 }
+
 
 @end
 
